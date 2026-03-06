@@ -1,3 +1,4 @@
+
 import pandas as pd
 import numpy as np
 from statsmodels.tsa.arima.model import ARIMA
@@ -42,18 +43,9 @@ class ARIMAXModel:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
                 df[col] = df[col].astype('float64')
         
-        # Remove rows where farmgate_price is missing
+        # Remove rows where farmgate_price is missing, as it's the target variable
         if 'farmgate_price' in df.columns:
             df = df.dropna(subset=['farmgate_price'])
-        
-        # Fill missing values in original exogenous variables
-        for col in ['oil_price_trend', 'peso_dollar_rate']:
-            if col in df.columns:
-                df[col] = df[col].ffill().bfill()
-                if df[col].isna().any():
-                    mean_val = df[col].mean()
-                    df[col] = df[col].fillna(mean_val if pd.notna(mean_val) else 0.0)
-                df[col] = df[col].astype('float64')
         
         # Sort by date BEFORE creating features
         df = df.sort_values('date').reset_index(drop=True)
@@ -62,26 +54,24 @@ class ARIMAXModel:
             # ===== CREATE LAGGED EXOGENOUS FEATURES =====
             print("[PREPARE] Creating lagged exogenous features...")
             
-            # Lagged oil prices (1 day and 3 days ago)
+            # Lagged oil prices (1, 7 and 30 days ago)
             if 'oil_price_trend' in df.columns:
-                df['oil_price_lag1'] = df['oil_price_trend'].shift(1)
-                df['oil_price_lag3'] = df['oil_price_trend'].shift(3)
-                df['oil_price_ma7'] = df['oil_price_trend'].rolling(window=7, min_periods=1).mean()
-            
-            # Lagged peso rates (1 day ago)
+                df['oil_price_lag1']  = df['oil_price_trend'].shift(1)          # previous record
+                df['oil_price_ma7']   = df['oil_price_trend'].rolling(7, min_periods=1).mean()   # last 7 records
+                df['oil_price_ma30']  = df['oil_price_trend'].rolling(30, min_periods=1).mean() # last 30 records
+                
+            # Lagged peso rates (1 and 7 days ago)
             if 'peso_dollar_rate' in df.columns:
-                df['peso_rate_lag1'] = df['peso_dollar_rate'].shift(1)
-                df['peso_rate_ma7'] = df['peso_dollar_rate'].rolling(window=7, min_periods=1).mean()
+                df['peso_dollar_rate_lag1'] = df['peso_dollar_rate'].shift(1)   # previous record
+                df['peso_rate_ma7']   = df['peso_dollar_rate'].rolling(7, min_periods=1).mean()  # last 7 records
             
-        
-            df['month'] = df['date'].dt.month
-      
-      
             # Ensure all new columns are float64
             lag_columns = [
-                'oil_price_lag1', 'oil_price_lag3', 'oil_price_ma7',
-                'peso_rate_lag1', 'peso_rate_ma7',
-                'month', 
+                'oil_price_lag1',
+                'oil_price_ma7',
+                'oil_price_ma30',
+                'peso_dollar_rate_lag1',
+                'peso_rate_ma7',
             ]
             
             for col in lag_columns:
@@ -134,33 +124,47 @@ class ARIMAXModel:
         # --- Prepare Data ---
         endog = df['farmgate_price'].copy()
         
-        # USE LAGGED EXOGENOUS VARIABLES
-        available_exog = [
-            'oil_price_lag1',       # Yesterday's oil price
-            'peso_rate_lag1',       # Yesterday's peso rate
-            'oil_price_ma7',        # 7-day oil price moving average
-            'peso_rate_ma7',        # 7-day peso rate moving average
-            'month',                # Calendar month (1-12)
+        # EVALUATION: include all variables to assess statistical significance
+        evaluation_exog = [
+            'oil_price_trend',    
+            'peso_dollar_rate',   
+            'oil_price_lag1',        
+            'peso_dollar_rate_lag1', 
+            'oil_price_ma7',         
+            'oil_price_ma30',      
+            'peso_rate_ma7',        
+    
         ]
+        # DEPLOYMENT: only statistically significant variables (p < 0.05)
+        deployment_exog = [
+            'oil_price_trend',    
+            'peso_dollar_rate',   
+            'oil_price_ma7',       
+            'oil_price_ma30',        
+            'peso_rate_ma7',         
+        ]
+
+        # Choose variables based on mode
+        exog_to_use = deployment_exog if is_deployment else evaluation_exog
         
         valid_exog_columns = [
-            col for col in available_exog 
+            col for col in exog_to_use
             if col in df.columns and df[col].nunique() > 1
         ]
         
         self.exog_columns = valid_exog_columns
+        print(f"[TRAIN] Mode: {'DEPLOYMENT' if is_deployment else 'EVALUATION'}")
         print(f"[TRAIN] Using exogenous variables: {self.exog_columns}")
         
         exog = None
         if self.exog_columns:
             exog = df[self.exog_columns].copy()
-            # Store last known exogenous values for forecasting
-            self.last_known_exog = exog.iloc[-10:].copy()  # Last 10 observations
-            self.last_date = df.index[-1]  # Store last date
+            self.last_known_exog = exog.iloc[-30:].copy()
+            self.last_date = df.index[-1]
         
         try:
             if is_deployment:
-                # ======================================================== 
+                # ========================================================
                 # DEPLOYMENT MODE: Train on 100% of Data
                 # ========================================================
                 full_endog = np.asarray(endog.values, dtype=np.float64)
@@ -173,14 +177,8 @@ class ARIMAXModel:
                 self.model = ARIMA(full_endog, exog=full_exog, order=self.order)
                 self.fitted_model = self.model.fit()
                 
-                in_sample_preds = self.fitted_model.predict()
-                
-                mae = mean_absolute_error(full_endog, in_sample_preds)
-                rmse = np.sqrt(mean_squared_error(full_endog, in_sample_preds))
-                mape = np.mean(np.abs((full_endog - in_sample_preds) / (full_endog + 1e-10))) * 100
-                
-                print(f"[DEPLOYMENT] In-sample MAE: {mae:.2f}, RMSE: {rmse:.2f}, MAPE: {mape:.2f}%")
-                
+                print(f"[DEPLOYMENT] Model fitted successfully.")
+
                 return {
                     'is_deployment': True,
                 }
@@ -201,17 +199,17 @@ class ARIMAXModel:
                 
                 # Split data
                 train_endog_array = np.asarray(endog.iloc[:train_end].values, dtype=np.float64)
-                val_endog_array = np.asarray(endog.iloc[train_end:val_end].values, dtype=np.float64)
-                test_endog_array = np.asarray(endog.iloc[val_end:test_end].values, dtype=np.float64)
+                val_endog_array   = np.asarray(endog.iloc[train_end:val_end].values, dtype=np.float64)
+                test_endog_array  = np.asarray(endog.iloc[val_end:test_end].values, dtype=np.float64)
                 
                 train_exog_array = np.asarray(exog.iloc[:train_end].values, dtype=np.float64) if exog is not None else None
-                val_exog_array = np.asarray(exog.iloc[train_end:val_end].values, dtype=np.float64) if exog is not None else None
-                test_exog_array = np.asarray(exog.iloc[val_end:test_end].values, dtype=np.float64) if exog is not None else None
+                val_exog_array   = np.asarray(exog.iloc[train_end:val_end].values, dtype=np.float64) if exog is not None else None
+                test_exog_array  = np.asarray(exog.iloc[val_end:test_end].values, dtype=np.float64) if exog is not None else None
                 
                 # Print data statistics
                 print(f"[EVALUATION] Train - Mean: {train_endog_array.mean():.2f}, Std: {train_endog_array.std():.2f}")
-                print(f"[EVALUATION] Val - Mean: {val_endog_array.mean():.2f}, Std: {val_endog_array.std():.2f}")
-                print(f"[EVALUATION] Test - Mean: {test_endog_array.mean():.2f}, Std: {test_endog_array.std():.2f}")
+                print(f"[EVALUATION] Val   - Mean: {val_endog_array.mean():.2f}, Std: {val_endog_array.std():.2f}")
+                print(f"[EVALUATION] Test  - Mean: {test_endog_array.mean():.2f}, Std: {test_endog_array.std():.2f}")
                 
                 # Train on train split
                 self.model = ARIMA(train_endog_array, exog=train_exog_array, order=self.order)
@@ -222,45 +220,45 @@ class ARIMAXModel:
                 # --- VALIDATION SET EVALUATION ---
                 val_predictions = self.fitted_model.forecast(steps=len(val_endog_array), exog=val_exog_array)
                 
-                val_mae = mean_absolute_error(val_endog_array, val_predictions)
+                val_mae  = mean_absolute_error(val_endog_array, val_predictions)
                 val_rmse = np.sqrt(mean_squared_error(val_endog_array, val_predictions))
                 val_mape = np.mean(np.abs((val_endog_array - val_predictions) / (val_endog_array + 1e-10))) * 100
                 
-                print(f"[EVALUATION] Validation Metrics - MAE: {val_mae:.2f}, RMSE: {val_rmse:.2f}, MAPE: {val_mape:.2f}%")
+                print(f"[EVALUATION] Validation - MAE: {val_mae:.2f}, RMSE: {val_rmse:.2f}, MAPE: {val_mape:.2f}%")
                 
                 # --- TEST SET EVALUATION ---
-                # For proper test evaluation, retrain on train+val
+                # Retrain on train+val for unbiased test evaluation
                 trainval_endog = np.concatenate([train_endog_array, val_endog_array])
-                trainval_exog = np.concatenate([train_exog_array, val_exog_array]) if exog is not None else None
+                trainval_exog  = np.concatenate([train_exog_array, val_exog_array]) if exog is not None else None
                 
-                final_model = ARIMA(trainval_endog, exog=trainval_exog, order=self.order)
+                final_model  = ARIMA(trainval_endog, exog=trainval_exog, order=self.order)
                 final_fitted = final_model.fit()
                 
                 test_predictions = final_fitted.forecast(steps=len(test_endog_array), exog=test_exog_array)
                 
-                test_mae = mean_absolute_error(test_endog_array, test_predictions)
+                test_mae  = mean_absolute_error(test_endog_array, test_predictions)
                 test_rmse = np.sqrt(mean_squared_error(test_endog_array, test_predictions))
                 test_mape = np.mean(np.abs((test_endog_array - test_predictions) / (test_endog_array + 1e-10))) * 100
                 
-                print(f"[EVALUATION] Test Metrics - MAE: {test_mae:.2f}, RMSE: {test_rmse:.2f}, MAPE: {test_mape:.2f}%")
+                print(f"[EVALUATION] Test - MAE: {test_mae:.2f}, RMSE: {test_rmse:.2f}, MAPE: {test_mape:.2f}%")
                 
-                # Store the final model (trained on train+val)
+                # Store final model (trained on train+val)
                 self.fitted_model = final_fitted
                 print(self.fitted_model.summary())
                 
                 return {
                     'aic': float(final_fitted.aic),
                     # Validation metrics
-                    'val_mae': val_mae,
+                    'val_mae':  val_mae,
                     'val_rmse': val_rmse,
                     'val_mape': val_mape,
                     # Test metrics
-                    'mae': test_mae,
+                    'mae':  test_mae,
                     'rmse': test_rmse,
                     'mape': test_mape,
-                    # Plotting data (test set only for cleaner viz)
+                    # Plotting data
                     'plot_actual': test_endog_array.tolist(),
-                    'plot_preds': test_predictions.tolist(),
+                    'plot_preds':  test_predictions.tolist(),
                     'is_deployment': False
                 }
         
@@ -359,79 +357,44 @@ class ARIMAXModel:
         return forecast_result
 
     def create_future_exog_with_latest(self, steps, latest_oil, latest_peso):
-        """
-        Create future exogenous variables using LATEST values from farmer/ICC.
-        Used for real-time deployment forecasting.
-        
-        Args:
-            steps: Number of future periods to forecast
-            latest_oil: Current oil price from ICC
-            latest_peso: Current peso/dollar rate from farmer
-            
-        Returns:
-            numpy array of shape (steps, n_exog_features)
-        """
         if not self.exog_columns or self.last_date is None:
             return None
-        
-        print(f"[FORECAST] Creating future exog with latest values for {steps} steps...")
-        
-        # Calculate 7-day moving averages using last known data + latest values
-        if self.last_known_exog is not None and 'oil_price_trend' in self.original_data.columns:
-            # Get last 6 historical values + latest value for MA calculation
-            last_6_oil = self.original_data['oil_price_trend'].iloc[-6:].tolist()
-            oil_ma7 = np.mean(last_6_oil + [latest_oil])
-            
+
+        if self.original_data is not None and 'oil_price_trend' in self.original_data.columns:
+            last_6_oil  = self.original_data['oil_price_trend'].iloc[-6:].tolist()
+            last_29_oil = self.original_data['oil_price_trend'].iloc[-29:].tolist()
             last_6_peso = self.original_data['peso_dollar_rate'].iloc[-6:].tolist()
+
+            oil_ma7  = np.mean(last_6_oil  + [latest_oil])
+            oil_ma30 = np.mean(last_29_oil + [latest_oil])
             peso_ma7 = np.mean(last_6_peso + [latest_peso])
         else:
-            # Fallback to latest values
-            oil_ma7 = latest_oil
+            oil_ma7  = latest_oil
+            oil_ma30 = latest_oil
             peso_ma7 = latest_peso
-        
+
         future_exog = []
-        
+
         for i in range(steps):
             exog_row = []
-            
-            # Calculate future date
-            future_date = self.last_date + pd.Timedelta(days=i+1)
-            
+            future_date = self.last_date + pd.Timedelta(days=i + 1)
+
             for col in self.exog_columns:
                 if col == 'oil_price_lag1':
-                    # Use latest oil price (from ICC or from farmer input)
                     exog_row.append(float(latest_oil))
-                
-                elif col == 'oil_price_lag3':
-                    # Use latest oil price (assuming stable over 3 days)
-                    exog_row.append(float(latest_oil))
-                
                 elif col == 'oil_price_ma7':
-                    # Use calculated 7-day moving average
                     exog_row.append(float(oil_ma7))
-                
-                elif col == 'peso_rate_lag1':
-                    # Use latest peso rate (from farmer input)
+                elif col == 'oil_price_ma30':
+                    exog_row.append(float(oil_ma30))
+                elif col == 'peso_dollar_rate_lag1':
                     exog_row.append(float(latest_peso))
-                
                 elif col == 'peso_rate_ma7':
-                    # Use calculated 7-day moving average
                     exog_row.append(float(peso_ma7))
-                
-                elif col == 'month':
-                    exog_row.append(float(future_date.month))
-                
-    
-                
                 else:
-                    # For any other column, use last known value
                     exog_row.append(float(self.last_known_exog[col].iloc[-1]))
-            
+
             future_exog.append(exog_row)
-        
+
         future_exog_array = np.array(future_exog, dtype=np.float64)
         print(f"[FORECAST] Future exog shape: {future_exog_array.shape}")
-        print(f"[FORECAST] Using latest_oil={latest_oil}, latest_peso={latest_peso}")
-        
         return future_exog_array
-    

@@ -1,6 +1,8 @@
 from django.urls import path
 from . import views
 from django.urls import path, include
+from django.conf import settings
+from django.conf.urls.static import static
 urlpatterns = [
     # Public routes
     path('', views.home, name='home'),
@@ -18,5 +20,6 @@ urlpatterns = [
     path('admin-panel/model/<int:model_id>/activate/', views.activate_model, name='activate_model'),
     path('admin-panel/model/<int:model_id>/deactivate/', views.deactivate_model, name='deactivate_model'),
     path('admin-panel/model/<int:model_id>/delete/', views.delete_model, name='delete_model'),
-  
 ]
+if settings.DEBUG:
+    urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)

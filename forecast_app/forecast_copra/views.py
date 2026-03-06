@@ -20,13 +20,289 @@ from django.utils import timezone
 import base64
 import io
 import os
+from datetime import date, timedelta
 import json
 from io import BytesIO
-
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+from datetime import date, datetime
+import re
+import requests
+from bs4 import BeautifulSoup
+from datetime import date, datetime
+import re
 from .forms import ExcelUploadForm, LoginForm, TrainingDataForm, ForecastForm
 from .models import TrainingData, TrainedModel, ForecastLog, ExcelUpload
 from .utils.arimax_model import ARIMAXModel
 
+
+
+# The Scraping Helper
+def get_live_coconut_oil_price():
+    """Fetches real-time CNO price using dynamic Selenium scraping"""
+
+    data = {
+        "price":  None,
+        "date":   date.today().strftime('%b %d, %Y'),
+        "change": "0.00"
+    }
+
+    try:
+        # ── Setup headless Chrome ─────────────────────────────────────────
+        options = Options()
+        options.add_argument('--headless')
+        options.add_argument('--no-sandbox')
+        options.add_argument('--disable-dev-shm-usage')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--window-size=1920,1080')
+        options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                             'AppleWebKit/537.36 (KHTML, like Gecko) '
+                             'Chrome/120.0.0.0 Safari/537.36')
+
+        driver = webdriver.Chrome(
+            service=Service(ChromeDriverManager().install()),
+            options=options
+        )
+
+        driver.get("https://coconutcommunity.org/page-statistics/weekly-price-update")
+
+        # ── Wait until table/content is visible ───────────────────────────
+        WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
+
+        import time
+        time.sleep(3)  # extra wait for JS to finish rendering
+
+        page_source = driver.page_source
+
+        # ── DEBUG: print raw snippet around Philippines row ───────────────
+        snippet = re.search(
+            r'Philippines \(Domestic, Millgate Price\).{0,300}',
+            page_source, re.DOTALL
+        )
+        if snippet:
+            print(f"[SCRAPER DEBUG] HTML snippet:\n{snippet.group(0)}")
+        else:
+            print("[SCRAPER DEBUG] Philippines row NOT found in page source")
+
+        # ── Extract date from page ────────────────────────────────────────
+        date_match = re.search(r'(\d{1,2}\s+\w+\s+\d{4})', page_source)
+        if date_match:
+            try:
+                parsed = datetime.strptime(date_match.group(1), '%d %B %Y')
+                data['date'] = parsed.strftime('%b %d, %Y')
+            except:
+                data['date'] = date_match.group(1)
+
+        # ── Strategy 1: Exact XPath text match ───────────────────────────
+        try:
+            elements = driver.find_elements(By.XPATH,
+                "//*[normalize-space(text())='Philippines (Domestic, Millgate Price)']"
+            )
+            if elements:
+                parent = elements[0].find_element(By.XPATH, '..')
+                all_children = parent.find_elements(By.XPATH, './*')
+
+                # DEBUG: print all siblings
+                print(f"[SCRAPER DEBUG] Siblings found: {[c.text.strip() for c in all_children]}")
+
+                for i, child in enumerate(all_children):
+                    if 'Philippines (Domestic, Millgate Price)' in child.text.strip():
+                        print(f"[SCRAPER] Target row at index {i}")
+
+                        # Try next siblings one by one to find the price
+                        for j in range(i + 1, min(i + 5, len(all_children))):
+                            raw = all_children[j].text.replace(',', '').replace('USD', '').strip()
+                            print(f"[SCRAPER DEBUG] Checking sibling [{j}]: '{raw}'")
+                            try:
+                                price_val = float(raw.split()[0])  # take first number only
+                                if 500 < price_val < 10000:
+                                    data['price'] = price_val
+                                    print(f"[SCRAPER] Strategy 1 success: {price_val}")
+                                    # Change is the sibling after price
+                                    if j + 1 < len(all_children):
+                                        data['change'] = all_children[j + 1].text.strip()
+                                    break
+                            except (ValueError, IndexError):
+                                continue
+                        break
+
+        except Exception as e:
+            print(f"[SCRAPER] Strategy 1 failed: {e}")
+
+        # ── Strategy 2: Table row search ──────────────────────────────────
+        if not data['price']:
+            try:
+                rows = driver.find_elements(By.TAG_NAME, 'tr')
+                for row in rows:
+                    if 'Philippines' in row.text and 'Domestic' in row.text and 'Millgate' in row.text:
+                        cells = row.find_elements(By.TAG_NAME, 'td')
+                        print(f"[SCRAPER DEBUG] Table row cells: {[c.text for c in cells]}")
+                        for cell in cells:
+                            raw = cell.text.replace(',', '').replace('USD', '').strip()
+                            try:
+                                price_val = float(raw.split()[0])
+                                if 500 < price_val < 10000:
+                                    data['price'] = price_val
+                                    print(f"[SCRAPER] Strategy 2 success: {price_val}")
+                                    break
+                            except (ValueError, IndexError):
+                                continue
+                        break
+            except Exception as e:
+                print(f"[SCRAPER] Strategy 2 failed: {e}")
+
+        # ── Strategy 3: Regex on raw page source ──────────────────────────
+        if not data['price']:
+            match = re.search(
+                r'Philippines \(Domestic, Millgate Price\)[^\d]*([\d,]+)\s*USD',
+                page_source, re.DOTALL
+            )
+            if match:
+                try:
+                    price_val = float(match.group(1).replace(',', ''))
+                    if 500 < price_val < 10000:
+                        data['price'] = price_val
+                        print(f"[SCRAPER] Strategy 3 success: {price_val}")
+                except ValueError:
+                    pass
+
+        driver.quit()
+
+        # ── If all strategies fail, price stays None ──────────────────────
+        if not data['price']:
+            print("[SCRAPER] All strategies failed — price unavailable")
+
+        print(f"[SCRAPER] Final result: {data}")
+
+    except Exception as e:
+        print(f"[SCRAPER] Fatal error: {e}")
+
+    return data
+def get_live_peso_rate():
+    """Fetches real-time PHP/USD rate from BSP"""
+    data = {
+        "rate": None,
+        "date": date.today().strftime('%b %d, %Y')
+    }
+
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/120.0.0.0 Safari/537.36',
+        }
+
+        response = requests.get(
+            "https://www.bsp.gov.ph/statistics/external/day99_data.aspx",
+            headers=headers,
+            timeout=10
+        )
+
+        if response.status_code != 200:
+            print(f"[BSP SCRAPER] Failed: status {response.status_code}")
+            return data
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+
+        # ── Get all table rows ────────────────────────────────────────────
+        rows = soup.find_all('tr')
+
+        # ── Find header row to get column positions ───────────────────────
+        # Header looks like: Date | Dec-24 | Jan-25 | Feb-25 | Mar-25 ...
+        header_row = None
+        col_months = []
+
+        for row in rows:
+            cells = row.find_all('td')
+            for cell in cells:
+                if cell.text.strip() == 'Date':
+                    header_row = cells
+                    break
+            if header_row:
+                break
+
+        if header_row:
+            # Extract month-year labels (e.g. "Jan-25", "Feb-26")
+            for cell in header_row:
+                text = cell.text.strip()
+                if re.match(r'[A-Za-z]{3}-\d{2}', text):
+                    col_months.append(text)
+
+        print(f"[BSP SCRAPER] Columns found: {col_months}")
+
+        # ── Get today's day number ────────────────────────────────────────
+        today = date.today()
+        today_day = today.day
+        today_month_year = today.strftime('%b-%y')  # e.g. "Mar-26"
+
+        print(f"[BSP SCRAPER] Looking for day={today_day}, month={today_month_year}")
+
+        # ── Find the column index for current month ───────────────────────
+        col_index = None
+        if today_month_year in col_months:
+            col_index = col_months.index(today_month_year)
+            print(f"[BSP SCRAPER] Current month column index: {col_index}")
+
+        # ── Find today's row and get the rate ─────────────────────────────
+        best_rate = None
+        best_day  = None
+
+        for row in rows:
+            cells = row.find_all('td')
+            non_empty = [c.text.strip() for c in cells if c.text.strip()]
+
+            if not non_empty:
+                continue
+
+            # First non-empty cell should be the day number
+            try:
+                day_num = int(non_empty[0])
+            except ValueError:
+                continue
+
+            # Get all numeric values in this row
+            values = []
+            for cell in cells:
+                raw = cell.text.strip().replace(',', '')
+                try:
+                    val = float(raw)
+                    if 40 < val < 100:  # PHP/USD range sanity check
+                        values.append((day_num, val))
+                except ValueError:
+                    continue
+
+            if values:
+                # Pick the last valid rate for this day (most recent month column)
+                last_val = values[-1][1]
+                if day_num <= today_day:
+                    best_rate = last_val
+                    best_day  = day_num
+
+        if best_rate:
+            data['rate'] = best_rate
+            # Reconstruct the date
+            try:
+                rate_date = date(today.year, today.month, best_day)
+                data['date'] = rate_date.strftime('%b %d, %Y')
+            except:
+                data['date'] = date.today().strftime('%b %d, %Y')
+            print(f"[BSP SCRAPER] Success: {data}")
+        else:
+            print("[BSP SCRAPER] No rate found")
+
+    except requests.exceptions.Timeout:
+        print("[BSP SCRAPER] Timeout")
+    except Exception as e:
+        print(f"[BSP SCRAPER] Error: {e}")
+
+    return data
 # ====================
 # PUBLIC VIEWS
 # ====================
@@ -34,6 +310,15 @@ from .utils.arimax_model import ARIMAXModel
 def home(request):
     """Home page with forecast form"""
 
+    # ── Fetch Latest Farmgate Price ──────────────────────────────────────────
+    latest_data = TrainingData.objects.order_by('-date').first()
+    latest_farmgate_price = float(latest_data.farmgate_price) if latest_data else None
+    latest_farmgate_date  = latest_data.date if latest_data else None
+    
+    live_market = get_live_coconut_oil_price()
+    print(f"[DEBUG HOME] live_market = {live_market}")
+    live_peso    = get_live_peso_rate() 
+    print(f"[DEBUG HOME] live_peso = {live_peso}")
     # -------- Handle form submission --------
     if request.method == 'POST':
         form = ForecastForm(request.POST)
@@ -78,8 +363,14 @@ def home(request):
                 )
 
                 # ── Forecast Dates ───────────────────────────────────────
+                forecast_start = (
+                    latest_farmgate_date + timedelta(days=1)
+                    if latest_farmgate_date
+                    else datetime.now().date()
+                )
+
                 forecast_dates = pd.date_range(
-                    start=datetime.now().date(),
+                    start=forecast_start,
                     periods=forecast_horizon,
                     freq='D',
                 ).strftime('%Y-%m-%d').tolist()
@@ -154,13 +445,11 @@ def home(request):
                             f"You have flexibility to sell based on your logistics and cash-flow needs."
                         )
 
-                    # ────────────────────────────────────────────────────
-                    # RECOMMENDATIONS (Objective 2)
-                    # ────────────────────────────────────────────────────
+                    # ── RECOMMENDATIONS ──────────────────────────────────
 
                     # 1. OPTIMAL SELLING TIME
                     recommendations.append(
-                        f"📅 OPTIMAL SELLING TIME: Based on the forecast, the best time to sell "
+                        f"📅OPTIMAL SELLING TIME: Based on the forecast, the best time to sell "
                         f"your copra is on <strong>{best_day_date}</strong> with an estimated price of "
                         f"<strong>₱{best_day_price:.2f}/kg</strong>. "
                         f"This is the highest projected price within your {forecast_horizon}-day forecast window."
@@ -169,22 +458,21 @@ def home(request):
                     # 2. SELL NOW OR WAIT?
                     if trend == 'increasing':
                         recommendations.append(
-                            f"⏳ SELL OR WAIT: Prices are trending <strong>upward</strong>. "
+                            f"SELL OR WAIT: Prices are trending <strong>upward</strong>. "
                             f"Waiting until <strong>{best_day_date}</strong> could give you "
                             f"₱{best_day_price - start_price:.2f}/kg more than selling today. "
                             f"Only wait if your copra is properly dried and stored."
                         )
                     elif trend == 'decreasing':
                         recommendations.append(
-                            f"🚨 SELL OR WAIT: Prices are trending <strong>downward</strong>. "
+                            f"SELL OR WAIT: Prices are trending <strong>downward</strong>. "
                             f"It is advised to <strong>sell as soon as possible</strong> to protect your income. "
                             f"Delaying may result in ₱{start_price - end_price:.2f}/kg loss."
                         )
                     else:
                         recommendations.append(
-                            f"📊 SELL OR WAIT: Prices are <strong>stable</strong> with minimal change expected. "
-                            f"You can sell at your convenience. Focus on reducing transport and "
-                            f"handling costs to maximize your net income."
+                            f"SELL OR WAIT: Prices are <strong>stable</strong> with minimal change expected. "
+                            f"You can sell at your convenience. "
                         )
 
                     # 3. RISK ADVISORY
@@ -192,19 +480,17 @@ def home(request):
                         recommendations.append(
                             f"⚠️ RISK ADVISORY: Price volatility is <strong>HIGH ({volatility:.1f}%)</strong>. "
                             f"Avoid selling all your copra on a single day. "
-                            f"Split your sales across multiple days to reduce the risk of selling at a low point."
                         )
                     elif volatility > 7:
                         recommendations.append(
                             f"⚠️ RISK ADVISORY: Moderate price fluctuations detected ({volatility:.1f}% volatility). "
-                            f"Monitor daily oil price and peso-dollar rate changes before finalizing "
+                            f"Monitor weekly coconut oil price and daily peso-dollar rate changes before finalizing "
                             f"your selling schedule."
                         )
                     else:
                         recommendations.append(
                             f"✅ RISK ADVISORY: Price forecast is <strong>stable "
                             f"(low volatility: {volatility:.1f}%)</strong>. "
-                            f"You can confidently plan your transport and logistics ahead of time."
                         )
 
                     # 4. PRICE RANGE AWARENESS
@@ -237,13 +523,15 @@ def home(request):
                     'price_range':            price_range,
                     'summary_recommendation': summary_recommendation,
                     'recommendations':        recommendations,
+                    'forecast_start': forecast_start,
+                    'latest_farmgate_price':  latest_farmgate_price,
+                    'latest_farmgate_date':   latest_farmgate_date,
                 })
-
+            
             except Exception as e:
-                import traceback
-                traceback.print_exc()
-                messages.error(request, f'Error making forecast: {str(e)}')
+                messages.error(request, f'Forecast error: {str(e)}')
                 return redirect('home')
+        pass
 
     else:
         form = ForecastForm()
@@ -266,6 +554,17 @@ def home(request):
         'model_available': model_available,
         'active_model':    active_model,
         'model_info':      model_info,
+        'suggested_oil':  latest_data.oil_price_trend,
+        'suggested_peso': latest_data.peso_dollar_rate,
+        'is_negative':   "-" in str(live_market['change']),
+        'live_oil_price': f"{live_market['price']:.2f}" if live_market['price'] else "Unavailable",
+        'live_oil_date':  live_market['date'],
+        'live_oil_change': live_market['change'],    
+        'latest_date':    latest_data.date,
+        'live_peso_rate':  f"{live_peso['rate']:.2f}" if live_peso['rate'] else None,
+        'live_peso_date':  live_peso['date'],
+        'latest_farmgate_price':  latest_farmgate_price,
+        'latest_farmgate_date':   latest_farmgate_date,
     })
 
 def recent_forecasts(request):
@@ -854,59 +1153,70 @@ def get_forecast_api(request):
     """API endpoint for forecast"""
     if request.method == 'POST':
         try:
-            oil_price = float(request.POST.get('oil_price_trend'))
-            peso_dollar = float(request.POST.get('peso_dollar_rate'))
+            oil_price        = float(request.POST.get('oil_price_trend'))
+            peso_dollar      = float(request.POST.get('peso_dollar_rate'))
             forecast_horizon = int(request.POST.get('forecast_horizon'))
-            
-            # Get active model
+
+            # ✅ Get active model
             active_model = TrainedModel.objects.get(is_active=True)
-            
-            # Load model and make prediction
+
+            # ✅ Load model
             arimax = ARIMAXModel()
             arimax.load_model(active_model.model_file_path)
-            
-            # Create exogenous array
-            exog_future = np.array([[oil_price, peso_dollar]] * forecast_horizon)
-            
-            # Make forecast
-            forecast_result = arimax.forecast(steps=forecast_horizon, exog_future=exog_future)
-            
-            # Get the predicted price
-            if hasattr(forecast_result, 'iloc'):
-                predicted_price = float(forecast_result.iloc[-1])
+
+            # ✅ Let model build exog correctly via create_future_exog_with_latest
+            forecast_result = arimax.forecast(
+                steps=forecast_horizon,
+                use_latest_values=True,
+                latest_oil=oil_price,
+                latest_peso=peso_dollar,
+            )
+
+            # ✅ Dynamic start date from DB
+            latest_data = TrainingData.objects.order_by('-date').first()
+            latest_data_date = latest_data.date if latest_data else date.today()
+
+            forecast_dates = [
+                (latest_data_date + timedelta(days=i + 1)).strftime('%B %d, %Y')
+                for i in range(forecast_horizon)
+            ]
+
+            # ✅ All forecast values
+            if hasattr(forecast_result, 'tolist'):
+                forecast_values = forecast_result.tolist()
             else:
-                predicted_price = float(forecast_result[-1])
-            
-            # Save to logs
+                forecast_values = list(forecast_result)
+
+            # ✅ Pair dates with prices
+            daily_forecast = [
+                {'date': d, 'predicted_price': round(v, 2)}
+                for d, v in zip(forecast_dates, forecast_values)
+            ]
+
+            # ✅ Use average as the summary price for logging
+            predicted_price = round(float(np.mean(forecast_values)), 2)
+
             ForecastLog.objects.create(
                 forecast_horizon=forecast_horizon,
                 farmer_input_oil_price_trend=oil_price,
                 farmer_input_peso_dollar_rate=peso_dollar,
-                price_predicted=predicted_price
+                price_predicted=predicted_price,
             )
-            
+
             return JsonResponse({
-                'success': True,
-                'predicted_price': predicted_price,
-                'oil_price': oil_price,
+                'success':          True,
+                'daily_forecast':   daily_forecast,
+                'predicted_price':  predicted_price,
+                'oil_price':        oil_price,
                 'peso_dollar_rate': peso_dollar,
                 'forecast_horizon': forecast_horizon,
-                'model_name': active_model.name,
-                'accuracy': active_model.accuracy
+                'model_name':       active_model.name,
+                'accuracy':         active_model.accuracy,
             })
-            
+
         except TrainedModel.DoesNotExist:
-            return JsonResponse({
-                'success': False,
-                'error': 'No trained model available'
-            })
+            return JsonResponse({'success': False, 'error': 'No trained model available'})
         except Exception as e:
-            return JsonResponse({
-                'success': False,
-                'error': str(e)
-            })
-    
-    return JsonResponse({
-        'success': False,
-        'error': 'POST method required'
-    })
+            return JsonResponse({'success': False, 'error': str(e)})
+
+    return JsonResponse({'success': False, 'error': 'POST method required'})

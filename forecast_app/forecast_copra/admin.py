@@ -77,3 +77,33 @@ class ExcelUploadAdmin(admin.ModelAdmin):
             'classes': ('collapse',),
         }),
     )
+    
+    def save_model(self, request, obj, form, change):
+        super().save_model(request, obj, form, change)
+        
+        try:
+            df = pd.read_excel(obj.file.path)
+            
+            # Normalize column names
+            df.columns = [col.strip().lower().replace(' ', '_') for col in df.columns]
+            
+            count = 0
+            for _, row in df.iterrows():
+                TrainingData.objects.update_or_create(
+                    date=row['date'],
+                    defaults={
+                        'farmgate_price': row['farmgate_price'],
+                        'oil_price_trend': row['oil_price_trend'],
+                        'peso_dollar_rate': row['peso_dollar_rate'],
+                    }
+                )
+                count += 1
+            
+            obj.processed = True
+            obj.rows_imported = count
+            obj.save()
+            
+            messages.success(request, f"✅ Successfully imported {count} rows into Training Data.")
+        
+        except Exception as e:
+            messages.error(request, f"❌ Failed to process file: {e}")
